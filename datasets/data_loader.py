@@ -1,50 +1,66 @@
-"""
-datasets/data_loader.py
-
-전처리된 cyp2c19_{train,valid,test}.csv 파일을 불러와,
-SMILES -> (int index list) 변환 후 PyTorch DataLoader로 내보냅니다.
-
-구성:
-1) naive_char_tokenizer: 아주 간단한 문자 단위 토크나이저 예시
-2) CYP2C19Dataset: CSV 로드 + (SMILES -> 토큰 리스트) transform
-3) collate_fn: pad_sequence로 [batch_size, max_seq_len] 텐서화
-4) get_cyp2c19_dataloaders: train/valid/test DataLoader 생성
-"""
-
 import os
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 
-# 0) naive_char_tokenizer
-def naive_char_tokenizer(smiles_str: str, max_ord: int = 2000):
-    """
-    아주 간단한 문자 단위 -> 정수 변환 예시.
-    - 각 문자에 대해 ord(c)를 구하되, 너무 큰 ord는 잘라냄 (max_ord=2000 등)
-    - 실제로는 별도의 char2idx 사전 구축 등으로 더 정교하게 구현해야 함.
+from rdkit import Chem
+from rdkit.Chem import MolToSmiles
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
-    returns: List[int]
-    """
-    indices = []
-    for c in smiles_str:
-        val = ord(c)
-        if val > max_ord:
-            val = max_ord  
-        indices.append(val)
-    return indices
 
-# 1) Dataset
+###########################################################
+# 1. RDKit-based tokenizer
+###########################################################
+def rdkit_tokenizer(smiles_str: str):
+
+    mol = Chem.MolFromSmiles(smiles_str)
+    if mol is None:
+        return []
+    return [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+
+
+###########################################################
+# 2. SMILES standardization
+###########################################################
+def standardize_smiles(smiles: str, apply_standardization: bool = True, remove_stereo: bool = True) -> str:
+
+    if not apply_standardization:
+        return smiles
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        lfc = rdMolStandardize.LargestFragmentChooser()
+        mol = lfc.choose(mol)
+        if mol is None:
+            return None
+
+        if remove_stereo:
+            Chem.rdmolops.RemoveStereochemistry(mol)
+
+        uncharger = rdMolStandardize.Uncharger()
+        mol = uncharger.uncharge(mol)
+
+        Chem.SanitizeMol(mol)
+        cano = MolToSmiles(mol, isomericSmiles=False)
+        return cano
+
+    except Exception:
+        return None
+
+
+###########################################################
+# 3. Dataset class
+###########################################################
 class CYP2C19Dataset(Dataset):
-    """
-    CSV 파일 -> (SMILES, Label).
-    'SMILES' 열, 'Label' 열이 있다고 가정.
-    transform: SMILES -> List[int] (or torch.Tensor)
-    """
+
     def __init__(self, csv_path, transform=None, is_classification=True):
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        
         self.df = pd.read_csv(csv_path)
         self.transform = transform
         self.is_classification = is_classification
@@ -59,48 +75,79 @@ class CYP2C19Dataset(Dataset):
         smiles_str = self.df.iloc[idx]["SMILES"]
         label_val = self.df.iloc[idx]["Label"]
 
-        # label to tensor
+        # Transform label into a tensor
         if self.is_classification:
             label_tensor = torch.tensor(label_val, dtype=torch.long)
         else:
             label_tensor = torch.tensor(label_val, dtype=torch.float)
 
-        # transform: SMILES -> List[int]
+        # Transform SMILES to tokenized data
         if self.transform is not None:
             smiles_data = self.transform(smiles_str)
         else:
-            # if not transform, return SMILES as string
-            smiles_data = smiles_str
+            smiles_data = []
 
         return smiles_data, label_tensor
 
-# 2) collate_fn
-def collate_fn(batch):
-    """
-    batch: list of (smiles_data, label_tensor)
-      - smiles_data: List[int]
-      - label_tensor: torch.long (이진분류) or float
 
-    반환:
-      - x_padded: [batch_size, max_seq_len] (long tensor)
-      - labels_tensor: [batch_size] (long)
-    """
-    x_list = []
-    y_list = []
+###########################################################
+# 4. Collate function for batching
+###########################################################
+def collate_fn(batch):
+
+    x_list, y_list = [], []
     for (smiles_data, label) in batch:
-        # smiles_data -> List[int] 형태
         x_tensor = torch.tensor(smiles_data, dtype=torch.long)
         x_list.append(x_tensor)
-        y_list.append(label) 
+        y_list.append(label)
 
-    # pad_sequence (batch_size, max_seq_len) 
+    # pad_sequence -> shape = [batch_size, max_seq_len]
     x_padded = rnn_utils.pad_sequence(x_list, batch_first=True, padding_value=0)
-    # label stack
     labels_tensor = torch.stack(y_list, dim=0)
 
     return x_padded, labels_tensor
 
-# 3) get_cyp2c19_dataloaders
+
+###########################################################
+# 5. Preprocessing and saving
+###########################################################
+def preprocess_and_save_data(
+    save_dir: str = "./data",
+    apply_standardization: bool = True,
+    remove_stereo: bool = True
+):
+
+    from tdc.single_pred import ADME
+
+    data = ADME(name='CYP2C19_Veith')
+    split = data.get_split()
+
+    def process_data(df):
+        processed_smiles, processed_labels = [], []
+        for _, row in df.iterrows():
+            std_smi = standardize_smiles(row["Drug"], apply_standardization, remove_stereo)
+            if std_smi:
+                processed_smiles.append(std_smi)
+                processed_labels.append(row["Y"])
+        return pd.DataFrame({"SMILES": processed_smiles, "Label": processed_labels})
+
+    train_data = process_data(split['train'])
+    valid_data = process_data(split['valid'])
+    test_data = process_data(split['test'])
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    train_data.to_csv(os.path.join(save_dir, "cyp2c19_train.csv"), index=False)
+    valid_data.to_csv(os.path.join(save_dir, "cyp2c19_valid.csv"), index=False)
+    test_data.to_csv(os.path.join(save_dir, "cyp2c19_test.csv"), index=False)
+
+    print(f"Processed data saved to {save_dir}")
+
+
+###########################################################
+# 6. DataLoader generation function
+###########################################################
 def get_cyp2c19_dataloaders(
     data_dir="./data",
     batch_size=32,
@@ -108,36 +155,27 @@ def get_cyp2c19_dataloaders(
     shuffle_train=True,
     is_classification=True
 ):
-    """
-    전처리 완료된 CSV (cyp2c19_train.csv, cyp2c19_valid.csv, cyp2c19_test.csv)를 불러와
-    SMILES를 naive_char_tokenizer로 변환 -> pad_sequence -> (x, y) 텐서 반환
 
-    Returns
-    -------
-    train_loader, valid_loader, test_loader
-    """
     train_csv = os.path.join(data_dir, "cyp2c19_train.csv")
     valid_csv = os.path.join(data_dir, "cyp2c19_valid.csv")
-    test_csv  = os.path.join(data_dir, "cyp2c19_test.csv")
+    test_csv = os.path.join(data_dir, "cyp2c19_test.csv")
 
-    # Dataset
     train_dataset = CYP2C19Dataset(
         train_csv,
-        transform=naive_char_tokenizer, 
+        transform=rdkit_tokenizer,
         is_classification=is_classification
     )
     valid_dataset = CYP2C19Dataset(
         valid_csv,
-        transform=naive_char_tokenizer,
+        transform=rdkit_tokenizer,
         is_classification=is_classification
     )
-    test_dataset  = CYP2C19Dataset(
+    test_dataset = CYP2C19Dataset(
         test_csv,
-        transform=naive_char_tokenizer,
+        transform=rdkit_tokenizer,
         is_classification=is_classification
     )
 
-    # DataLoader
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,

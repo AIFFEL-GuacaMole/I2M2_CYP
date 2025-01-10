@@ -1,17 +1,12 @@
 """
 main.py
 
-process:
-1) argparse -> model_type (unimodal/inter/intra/inter_intra), train/test option parsing
-2) data_loader.py -> get_cyp2c19_dataloaders
-3) load model (unimodal / inter / etc.)
-4) train or test
 """
 
 import argparse
 import torch
 import os
-import torch.nn as nn 
+import torch.nn as nn
 
 # DataLoader
 from datasets.data_loader import get_cyp2c19_dataloaders
@@ -29,18 +24,20 @@ from training_structures.inter_modality import (
     test_inter_modality
 )
 from training_structures.inter_and_intra_modality import (
-    train_inter_and_intra_modality,
-    test_inter_and_intra_modality
+    train_inter_intra_modality,
+    test_inter_intra_modality
 )
 
-# Fusion - fusion method (Concat, LowRankTensorFusion, etc.)
-from common_fusions.fusions import ConcatFusion 
-
+# Fusion methods
+from common_fusions.fusions import (
+    ConcatFusion, DynamicWeightedFusion, AttentionFusion, MultiplicativeFusion,
+    ResidualFusion, LowRankTensorFusion, LateFusion
+)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="unimodal",
-                        choices=["unimodal", "intra", "inter", "inter_intra"],
+                        choices=["unimodal", "inter","intra","inter_intra"],
                         help="Choose which model type to train/test.")
     parser.add_argument("--unimodal_arch", type=str, default="chembert",
                         choices=["chembert", "cnn_gru"],
@@ -48,14 +45,20 @@ def main():
     parser.add_argument("--train", action="store_true", help="If set, run training")
     parser.add_argument("--test", action="store_true", help="If set, run testing")
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--data_dir", type=str, default="./data",
                         help="Directory containing cyp2c19_{train,valid,test}.csv")
     parser.add_argument("--save_dir", type=str, default="./ckpts",
                         help="Directory to save model checkpoints")
+    parser.add_argument("--fusion_type", type=str, default="attention",
+                        choices=["concat", "lowrank", "dynamic", "attention", "multiplicative", "residual", "late"],
+                        help="Which fusion to use in inter modality")
+    parser.add_argument("--loss_type", type=str, default="focal_bce",
+                        choices=["focal_bce", "bce"],
+                        help="Loss function type for training.")
     args = parser.parse_args()
-
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Info] Running on device={device}")
 
@@ -66,14 +69,11 @@ def main():
         shuffle_train=True,
         is_classification=True
     )
-
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir, exist_ok=True)
 
-    # 1. UNIMODAL
+    # 1. Unimodal
     if args.model_type == "unimodal":
-
-        # Create unimodal model
         if args.unimodal_arch == "chembert":
             model = ChemBERTBinaryClassifier(
                 model_name_or_path="seyonec/PubChem10M_SMILES_BPE_450k",
@@ -83,8 +83,7 @@ def main():
             model_name = "unimodal_chembert.pt"
         else:
             model = CNNGRUBinaryClassifier(
-                # vocab_size, emb_dim, num_filters_list, kernel_sizes, hidden_dim, num_layers, num_classes
-                vocab_size=8000, 
+                vocab_size=800,
                 emb_dim=128,
                 num_filters_list=[64, 128],
                 kernel_sizes=[3, 5],
@@ -96,15 +95,19 @@ def main():
 
         save_path = os.path.join(args.save_dir, model_name)
 
-        # train
         if args.train:
-            best_state = train_unimodal(model, train_loader, valid_loader,
-                                        epochs=args.epochs, lr=args.lr, device=device)
-            if best_state is not None:
+            best_state = train_unimodal(
+                model=model,
+                train_loader=train_loader,
+                valid_loader=valid_loader,
+                epochs=args.epochs,
+                lr=args.lr,
+                device=device
+            )
+            if best_state:
                 torch.save(best_state, save_path)
                 print(f"[Info] Saved unimodal best state to {save_path}")
 
-        # test
         if args.test:
             if os.path.exists(save_path):
                 model.load_state_dict(torch.load(save_path))
@@ -113,25 +116,53 @@ def main():
                 print(f"[Warning] No checkpoint found at {save_path}. Testing untrained model.")
             test_unimodal(model, test_loader, device=device)
 
-
-    # 2. INTRA MODALITY
+    # 2. Intra Modality
     elif args.model_type == "intra":
+        # Load Unimodal Checkpoints
+        chembert_path = os.path.join(args.save_dir, "unimodal_chembert.pt")
+        cnn_gru_path = os.path.join(args.save_dir, "unimodal_cnn_gru.pt")
 
-        # chembert + cnn_gru
-        model1 = ChemBERTBinaryClassifier()
-        model2 = CNNGRUBinaryClassifier()
+        if not os.path.exists(chembert_path) or not os.path.exists(cnn_gru_path):
+            print("[Error] Unimodal checkpoints not found. Train unimodal models first.")
+            return
 
-        save_path1 = os.path.join(args.save_dir, "intra_chembert_1.pt")
-        save_path2 = os.path.join(args.save_dir, "intra_cnn_gru_1.pt")
+        model1 = ChemBERTBinaryClassifier(
+            model_name_or_path="seyonec/PubChem10M_SMILES_BPE_450k",
+            num_classes=2,
+            dropout_prob=0.4
+        )
+        model1.load_state_dict(torch.load(chembert_path))
+        
+        model2 = CNNGRUBinaryClassifier(
+            vocab_size=800,
+            emb_dim=128,
+            num_filters_list=[64, 128],
+            kernel_sizes=[3, 5],
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=2
+        )
+        model2.load_state_dict(torch.load(cnn_gru_path))
+
+        save_path1 = os.path.join(args.save_dir, "intra_chembert.pt")
+        save_path2 = os.path.join(args.save_dir, "intra_cnn_gru.pt")
 
         models = [model1, model2]
 
         if args.train:
-            best_states = train_intra_modality(models, train_loader, valid_loader,
-                                               epochs=args.epochs, lr=args.lr, device=device)
-            if best_states is not None:
+            best_states = train_intra_modality(
+                unimodal_models=models,
+                train_loader=train_loader,
+                valid_loader=valid_loader,
+                epochs=args.epochs,
+                lr=args.lr,
+                device=device,
+                loss_type=args.loss_type
+            )
+            if best_states:
                 torch.save(best_states[0], save_path1)
                 torch.save(best_states[1], save_path2)
+                print("[Info] Saved intra modality best states")
 
         if args.test:
             if os.path.exists(save_path1):
@@ -140,89 +171,249 @@ def main():
                 model2.load_state_dict(torch.load(save_path2))
             test_intra_modality(models, test_loader, device=device)
 
-
-    # 3. INTER MODALITY
+    # 3. Inter Modality
     elif args.model_type == "inter":
+        # load Unimodal checkpoitns
+        chembert_path = os.path.join(args.save_dir, "unimodal_chembert.pt")
+        cnn_gru_path = os.path.join(args.save_dir, "unimodal_cnn_gru.pt")
 
-        # chembert + cnn_gru -> fusion -> head
-        chembert_model = ChemBERTBinaryClassifier()
-        cnn_model = CNNGRUBinaryClassifier()
+        if not os.path.exists(chembert_path) or not os.path.exists(cnn_gru_path):
+            raise FileNotFoundError("[Error] Unimodal checkpoints not found. Train unimodal models first.")
 
+        chembert_model = ChemBERTBinaryClassifier(return_features=True)
+        chembert_model.load_state_dict(torch.load(chembert_path))
+        print(f"[Info] Loaded ChemBERT checkpoint from {chembert_path}")
+
+        cnn_model = CNNGRUBinaryClassifier(
+            vocab_size=800,
+            emb_dim=128,
+            num_filters_list=[64, 128],
+            kernel_sizes=[3, 5],
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=2,
+            return_features=True
+        )
+        cnn_model.load_state_dict(torch.load(cnn_gru_path))
+        print(f"[Info] Loaded CNN-GRU checkpoint from {cnn_gru_path}")
+
+        # Encoders 
         encoders = [chembert_model, cnn_model]
-        fusion = ConcatFusion()
-        head = nn.Linear(128 * 2, 2)
 
-        inter_model = InterModalModel(encoders, fusion, head)
+        # Projectors
+        projector_bert = nn.Linear(768, 128)
+        projector_cnn = nn.Linear(256, 128)
+        projectors = [projector_bert, projector_cnn]
 
-        # each loader of modality data - each transform data loader
+        # Fusion 
+        if args.fusion_type == "concat":
+            fusion = ConcatFusion()
+            fusion_output_dim = 128 * len(projectors)
+        elif args.fusion_type == "lowrank":
+            fusion = LowRankTensorFusion(input_dims=[128, 128], rank=16, output_dim=128)
+            fusion_output_dim = 128
+        elif args.fusion_type == "dynamic":
+            fusion = DynamicWeightedFusion(num_modalities=len(projectors), input_dim=128)
+            fusion_output_dim = 128
+        elif args.fusion_type == "attention":
+            fusion = AttentionFusion(input_dim=128, num_modalities=len(projectors), hidden_dim=64)
+            fusion_output_dim = 128
+        elif args.fusion_type == "multiplicative":
+            fusion = MultiplicativeFusion()
+            fusion_output_dim = 128
+        elif args.fusion_type == "residual":
+            fusion = ResidualFusion()
+            fusion_output_dim = 128
+        else:  # late fusion
+            fusion = LateFusion(input_dim=128, num_classes=2)
+            fusion_output_dim = 2  # Late Fusion directly outputs class logits
+
+        # Define head only if not using LateFusion
+        if args.fusion_type != "late":
+            head = nn.Sequential(
+                nn.Linear(fusion_output_dim, 128),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                nn.Linear(64, 2)  # Binary classification
+            )
+        else:
+            head = nn.Identity()
+
+        inter_model = InterModalModel(
+            encoders=encoders,
+            projectors=projectors,
+            fusion=fusion,
+            hidden_dim=128,        # Hidden dimension in MLP head
+            dropout_prob=0.4,      # Dropout probability
+            use_batch_norm=True    # Use BatchNorm in MLP head
+        )
+
+        # data loader
         train_loaders_list = [train_loader, train_loader]
         valid_loaders_list = [valid_loader, valid_loader]
-        test_loaders_list  = [test_loader,  test_loader]
+        test_loaders_list = [test_loader, test_loader]
 
         save_path = os.path.join(args.save_dir, "inter_model.pt")
 
+        # train, test
         if args.train:
-            best_state = train_inter_modality(inter_model, train_loaders_list, valid_loaders_list,
-                                              epochs=args.epochs, lr=args.lr, device=device)
-            if best_state is not None:
+            best_state = train_inter_modality(
+                model=inter_model,
+                train_loaders=train_loaders_list,
+                valid_loaders=valid_loaders_list,
+                epochs=args.epochs,
+                lr=args.lr,
+                device=device,
+                loss_type=args.loss_type
+            )
+            if best_state:
                 torch.save(best_state, save_path)
+                print(f"[Info] Saved inter model best state to {save_path}")
 
         if args.test:
             if os.path.exists(save_path):
                 inter_model.load_state_dict(torch.load(save_path))
+            else:
+                print(f"[Warning] No checkpoint found at {save_path}. Testing untrained model.")
             test_inter_modality(inter_model, test_loaders_list, device=device)
 
 
-    # 4. INTER - INTRA MODALITY
+    # 4. Inter-Intra Modality
     elif args.model_type == "inter_intra":
+        print("Main function started")
 
-        # inter_model (bert_for_inter + cnn_for_inter) + unimodal_models=[bert_only, cnn_only]
-        bert_only = ChemBERTBinaryClassifier()
-        cnn_only  = CNNGRUBinaryClassifier()
+        # Load Unimodal Checkpoints
+        unimodal_bert_path = os.path.join(args.save_dir, "unimodal_chembert.pt")
+        unimodal_cnn_path = os.path.join(args.save_dir, "unimodal_cnn_gru.pt")
 
-        bert_for_inter = ChemBERTBinaryClassifier()  
-        cnn_for_inter  = CNNGRUBinaryClassifier()
+        if not os.path.exists(unimodal_bert_path) or not os.path.exists(unimodal_cnn_path):
+            raise FileNotFoundError("[Error] Unimodal checkpoints not found. Train unimodal models first.")
 
-        fusion = ConcatFusion()
-        head = nn.Linear(128*2, 2)
-        inter_model = InterModalModel([bert_for_inter, cnn_for_inter], fusion, head)
+        unimodal_bert = ChemBERTBinaryClassifier(return_features=False)
+        unimodal_bert.load_state_dict(torch.load(unimodal_bert_path))
+        print(f"[Info] Loaded Unimodal ChemBERT checkpoint from {unimodal_bert_path}")
 
+        unimodal_cnn = CNNGRUBinaryClassifier(
+            vocab_size=800,
+            emb_dim=128,
+            num_filters_list=[64, 128],
+            kernel_sizes=[3, 5],
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=2
+        )
+        unimodal_cnn.load_state_dict(torch.load(unimodal_cnn_path))
+        print(f"[Info] Loaded Unimodal CNN-GRU checkpoint from {unimodal_cnn_path}")
+
+        # Define Inter-Model Encoders
+        inter_bert = ChemBERTBinaryClassifier(return_features=True)
+        inter_cnn = CNNGRUBinaryClassifier(
+            vocab_size=800,
+            emb_dim=128,
+            num_filters_list=[64, 128],
+            kernel_sizes=[3, 5],
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=2,
+            return_features=True
+        )
+
+        if args.fusion_type == "concat":
+            fusion = ConcatFusion()
+            fusion_output_dim = 128 * len(projectors)
+        elif args.fusion_type == "lowrank":
+            fusion = LowRankTensorFusion(input_dims=[128, 128], rank=16, output_dim=128)
+            fusion_output_dim = 128
+        elif args.fusion_type == "dynamic":
+            fusion = DynamicWeightedFusion(num_modalities=len(projectors), input_dim=128)
+            fusion_output_dim = 128
+        elif args.fusion_type == "attention":
+            fusion = AttentionFusion(input_dim=128, num_modalities=2, hidden_dim=64)
+            fusion_output_dim = 128
+        elif args.fusion_type == "multiplicative":
+            fusion = MultiplicativeFusion()
+            fusion_output_dim = 128
+        elif args.fusion_type == "residual":
+            fusion = ResidualFusion()
+            fusion_output_dim = 128
+        else:  # late fusion
+            fusion = LateFusion(input_dim=128, num_classes=2)
+            fusion_output_dim = 2  
+
+
+        # Load Inter Model Checkpoint if exists
+        inter_save_path = os.path.join(args.save_dir, "inter_model.pt")
+        if os.path.exists(inter_save_path):
+            inter_model = InterModalModel(
+                encoders=[inter_bert, inter_cnn],
+                projectors=[nn.Linear(768, 128), nn.Linear(256, 128)],
+                fusion=AttentionFusion(input_dim=128, num_modalities=2, hidden_dim=64),
+                hidden_dim=128,
+                dropout_prob=0.4,
+                use_batch_norm=True
+            )
+            inter_model.load_state_dict(torch.load(inter_save_path))
+            print(f"[Info] Loaded Inter Model checkpoint from {inter_save_path}")
+        else:
+            raise FileNotFoundError("[Error] Inter model checkpoint not found. Train inter model first.")
+
+        # Train and Validation Loaders
         train_loaders_list = [train_loader, train_loader]
         valid_loaders_list = [valid_loader, valid_loader]
-        test_loaders_list  = [test_loader,  test_loader]
+        test_loaders_list = [test_loader, test_loader]
 
-        save_path_inter     = os.path.join(args.save_dir, "inter_intra_inter.pt")
-        save_path_uni_bert  = os.path.join(args.save_dir, "inter_intra_uni_bert.pt")
-        save_path_uni_cnn   = os.path.join(args.save_dir, "inter_intra_uni_cnn.pt")
+        # Save paths for Inter-Intra
+        inter_intra_save_path = os.path.join(args.save_dir, "inter_intra_inter.pt")
+        unimodal_save_paths = [
+            os.path.join(args.save_dir, "inter_intra_uni_bert.pt"),
+            os.path.join(args.save_dir, "inter_intra_uni_cnn.pt")
+        ]
 
         if args.train:
-            best_states = train_inter_and_intra_modality(
-                inter_model,
-                [bert_only, cnn_only],
-                train_loaders_list,
-                valid_loaders_list,
+            best_states = train_inter_intra_modality(
+                inter_model=inter_model,
+                unimodal_models=[unimodal_bert, unimodal_cnn],
+                train_loaders=train_loaders_list,
+                valid_loaders=valid_loaders_list,
                 epochs=args.epochs,
                 lr=args.lr,
                 device=device,
-                alpha=0.5,
-                beta=0.5
+                alpha=0.25,
+                gamma=2.0
             )
-            if best_states is not None:
-                torch.save(best_states["inter_model"], save_path_inter)
-                torch.save(best_states["unimodals"][0], save_path_uni_bert)
-                torch.save(best_states["unimodals"][1], save_path_uni_cnn)
+            if best_states:
+                torch.save(best_states["inter_model"], inter_intra_save_path)
+                torch.save(best_states["unimodals"][0], unimodal_save_paths[0])
+                torch.save(best_states["unimodals"][1], unimodal_save_paths[1])
+                print("[Info] Saved Inter-Intra model checkpoints")
 
         if args.test:
-            if os.path.exists(save_path_inter):
-                inter_model.load_state_dict(torch.load(save_path_inter))
-            if os.path.exists(save_path_uni_bert):
-                bert_only.load_state_dict(torch.load(save_path_uni_bert))
-            if os.path.exists(save_path_uni_cnn):
-                cnn_only.load_state_dict(torch.load(save_path_uni_cnn))
+            # Load Inter-Intra Checkpoints
+            if os.path.exists(inter_intra_save_path):
+                inter_model.load_state_dict(torch.load(inter_intra_save_path))
+                print(f"[Info] Loaded Inter-Intra Inter Model checkpoint from {inter_intra_save_path}")
+            else:
+                print(f"[Warning] No Inter-Intra Inter Model checkpoint found. Testing with trained Inter Model.")
 
-            test_inter_and_intra_modality(
-                inter_model, [bert_only, cnn_only],
-                test_loaders_list, device=device
+            for i, path in enumerate(unimodal_save_paths):
+                if os.path.exists(path):
+                    if i == 0:
+                        unimodal_bert.load_state_dict(torch.load(path))
+                    elif i == 1:
+                        unimodal_cnn.load_state_dict(torch.load(path))
+                    print(f"[Info] Loaded Unimodal checkpoint from {path}")
+                else:
+                    print(f"[Warning] No checkpoint found for unimodal model {i + 1}. Using previously loaded model.")
+
+            # Test Inter-Intra Modality
+            test_inter_intra_modality(
+                inter_model=inter_model,
+                unimodal_models=[unimodal_bert, unimodal_cnn],
+                test_loaders=test_loaders_list,
+                device=device
             )
 
 
