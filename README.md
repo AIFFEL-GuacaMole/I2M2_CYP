@@ -1,77 +1,163 @@
-# I2M2_CYP
+# I2M2 ADMET Property Prediction
 
-## 프로젝트 개요
-
-**I2M2_CYP** 프로젝트는 TDC의 `CYP2C19_Veith` 데이터를 활용해 **CYP 이진 분류** 문제를 해결하기 위한 다양한 학습 구조를 시도합니다.  
-- **Unimodal 모델**: ChemBERT(`chembert_binary_classifier`), 1D CNN+GRU(`cnn_gru_binary_classifier`)  
-- **Intra Modality**: 같은 모달 내 여러 모델 앙상블/학습  
-- **Inter Modality**: 서로 다른 모달(예: BERT, CNN) 결합 (Fusion)  
-- **Inter + Intra Modality**: 두 기법을 혼합한 I2M2 방식
-
+This repository provides an end-to-end pipeline for multi-modality models (`unimodal`, `intra`, `inter`, `inter_intra`) to predict ADMET properties.  
+It supports classification and regression tasks, uses PyTorch-based training flows, and integrates seamlessly with Weights & Biases (wandb) for experiment tracking and hyperparameter sweeps.
 
 ---
 
-## 폴더 구조
+## Directory Structure
 
 ```
-I2M2_CYP/
-  ├─ data/
-  │   ├─ cyp2c19_train.csv  
-  │   ├─ cyp2c19_valid.csv  
-  │   └─ cyp2c19_test.csv  
-  ├─ datasets/  
-  │   ├─ __init__.py  
-  │   └─ data_loader.py              
-  ├─ unimodal/  
-  │   ├─ __init__.py  
-  │   ├─ chembert_binary_classifier.py    
-  │   └─ cnn_gru_binary_classifier.py     
-  ├─ training_structures/  
-  │   ├─ __init__.py  
-  │   ├─ unimodal.py                 
-  │   ├─ intra_modality.py           
-  │   ├─ inter_modality.py           
-  │   └─ inter_and_intra_modality.py  
-  ├─ common_fusions/  
-  │   ├─ __init__.py  
-  │   └─ fusions.py                  
-  ├─ main.py                         
-  └─ ckpts/                          
+I2M2_admet_property/
+├── main.py
+├── sweep.py
+├── sweep_config.yaml
+├── unimodal/
+│   ├── chemberta_1d.py
+│   ├── gin_2d.py
+│   └── unimol_3d.py
+├── datasets/
+│   ├── datasets.py
+│   └── data_loader.py
+├── common_fusions/
+│   └── fusions.py
+├── utils/
+│   ├── earlystop.py
+│   └── loss_fn.py
+└── training_structures/
+    ├── unimodal.py
+    ├── intra_modality.py
+    ├── inter_modality.py
+    ├── inter_and_intra_modality.py
+    ├── train.py
+    └── test.py
+```
+
+### Key Components
+- `main.py`: Entry point for training/testing. Parses arguments, loads data, configures models, and calls the train/test loops.  
+- `sweep.py`, `sweep_config.yaml`: Weights & Biases hyperparameter sweep support.  
+- `unimodal/`: Definitions for 1D (ChemBERTa), 2D (GIN), and 3D (UniMol) models.  
+- `datasets/`: Data loading logic. `datasets.py` handles basic CSV + SMILES -> fingerprint, `data_loader.py` builds a single dataset with 1D/2D/3D features.  
+- `common_fusions/fusions.py`: Fusion modules (e.g., ConcatFusion, CrossAttentionFusion).  
+- `utils/`: Early stopping and custom loss functions.  
+- `training_structures/`:  
+  - `train.py`, `test.py`: General training & testing loops with wandb logging, scheduler usage, etc.  
+  - `*_modality.py`: Logic for unimodal, intra-modality, inter-modality, and inter+intra forward passes.
+
+---
+
+## Requirements
+
+- Python 3.8+  
+- PyTorch 1.10+  
+- rdkit  
+- scikit-learn  
+- wandb  
+- molfeat  
+- (Optional) GPU with CUDA for accelerated training  
+
+Install all requirements:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ---
 
-## 실행 예시
+## Usage
 
-1. **Unimodal (CNN+GRU) 학습**  
-   ```bash
-   python main.py --model_type unimodal --unimodal_arch cnn_gru        --train --epochs 20 --batch_size 32 --lr 1e-4 --loss_type focal_bce
-   ```
-   - 모델 학습이 완료되면 `./ckpts/unimodal_cnn_gru.pt`에 파라미터가 저장
+Below examples assume you have `train_val.csv` and `test.csv` under the `./data` directory.
 
-2. **Unimodal (ChemBERT) 학습**  
-   ```bash
-   python main.py --model_type unimodal --unimodal_arch chembert       --train --epochs 20 --batch_size 32 --lr 1e-4 --loss_type bce
-   ```
-   - 학습 완료 후, `./ckpts/unimodal_chembert.pt`에 파라미터 저장
+### 1) Train a unimodal ChemBERTa (1D) classification model
 
-3. **Intra Modality**  
-   ```bash
-   python main.py --model_type intra --train --epochs 20 --batch_size 32 --lr 1e-4 --loss_type focal_bce
-   ```
-   - 같은 모달(또는 ChemBERT + CNN)을 앙상블하여 학습
+```bash
+python main.py \
+    --phase train \
+    --mode unimodal \
+    --task_type classification \
+    --model_type 1D \
+    --epochs 50 \
+    --lr 1e-4 \
+    --batch_size 32
+```
 
-4. **Inter Modality**  
-   ```bash
-   python main.py --model_type inter --train --epochs 20 --batch_size 32 --lr 1e-4 --fusion_type attension --loss_type focal_bce
-   ```
-   - 서로 다른 모달(encoders) + fusion 방식으로 학습
+This will read `./data/train_val.csv` and `./data/test.csv`, split train/val, generate embeddings for 1D, and train a single ChemBERTa model.  
+Logs and checkpoints (`best_unimodal_1D_classification.pth`) will be saved to `./ckpt`.
 
-5. **Inter + Intra Modality (I2M2)**  
-   ```bash
-   python main.py --model_type inter_intra --train --epochs 20 --batch_size 32 --lr 1e-4 --fusion_type attension --loss_type focal_bce
-   ```
-   - Inter 모달 모델과 unimodal(또는 intra) 모델을 함께 활용
+### 2) Test the unimodal model
 
-실행 시, 학습이 종료되면 검증(Val) 지표(Accuracy 등)가 표시되며, 최적 파라미터는 `./ckpts/` 폴더에 저장됩니다.  
-학습이 끝난 모델을 테스트하려면, `--train` 대신 `--test` 플래그를 추가하여 체크포인트 로드 후 성능을 확인할 수 있습니다.
+```bash
+python main.py \
+    --phase test \
+    --mode unimodal \
+    --task_type classification \
+    --model_type 1D
+```
+
+This will load `./ckpt/best_unimodal_1D_classification.pth` and evaluate it on `./data/test.csv`.
+
+### 3) Train an intra ensemble of 1D/2D/3D classification models
+
+```bash
+python main.py \
+    --phase train \
+    --mode intra \
+    --task_type classification \
+    --epochs 40 \
+    --lr 1e-4
+```
+
+This generates 1D/2D/3D features, trains three separate models (ChemBERTa, GIN, UniMol), and ensembles their outputs (simple sum).
+
+### 4) Inter-modality model training (fusion of modalities)
+
+```bash
+python main.py \
+    --phase train \
+    --mode inter \
+    --task_type classification \
+    --epochs 40
+```
+
+This builds three base models (1D/2D/3D) and uses their middle features along with a fusion module (e.g., CrossAttentionFusion).
+
+### 5) Inter + intra combined approach
+
+```bash
+python main.py \
+    --phase train \
+    --mode inter_intra \
+    --task_type regression
+```
+
+In `inter_and_intra_modality.py`, we sum the direct 1D/2D/3D outputs (intra) and also fuse their middle outputs (inter).
+
+### 6) WandB Sweep
+
+To run a hyperparameter sweep, add `--use_sweep` when `--phase train`:
+
+```bash
+python main.py --phase train --use_sweep --mode unimodal
+```
+
+The actual sweep configuration is in `sweep_config.yaml`. This will execute `run_sweep(args)` from `sweep.py`.
+
+---
+
+## Logging & Checkpoints
+
+This repository uses Weights & Biases (wandb) for logging. During training, the following metrics are logged:
+- **Train:** Loss, Accuracy (classification) or MSE (regression)  
+- **Validation:** Loss, Accuracy/AUPRC (classification) or MSE/MAE (regression)  
+
+A `ReduceLROnPlateau` scheduler monitors `val_loss`. The best model weights are saved to `./ckpt`.
+
+---
+
+## Acknowledgments
+
+- `rdkit` for SMILES handling  
+- `molfeat` for pretrained transformers  
+- `wandb` for experiment tracking  
+
+Feel free to modify the code for your own ADMET tasks or general molecular property prediction.

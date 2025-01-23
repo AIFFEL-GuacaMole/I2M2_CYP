@@ -1,201 +1,103 @@
+# data_loader.py
+
 import os
-import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.utils.rnn as rnn_utils
+from torch.utils.data import Dataset
+from molfeat.trans.pretrained import PretrainedDGLTransformer
+from molfeat.trans.pretrained.hf_transformers import PretrainedHFTransformer
+from unimol_tools import UniMolRepr
 
-from rdkit import Chem
-from rdkit.Chem import MolToSmiles
-from rdkit.Chem.MolStandardize import rdMolStandardize
+class FullFeatureDataset(Dataset):
+    def __init__(self, data, is_train=False, is_val=False, is_test=False):
+        self.data = data.reset_index(drop=True)
+        if is_train:
+            cache_path = "./data/train_features.pt"
+        elif is_val:
+            cache_path = "./data/val_features.pt"
+        elif is_test:
+            cache_path = "./data/test_features.pt"
+        else:
+            cache_path = None
 
+        if cache_path and os.path.exists(cache_path):
+            self.samples = torch.load(cache_path)
+        else:
+            self.samples = []
+            self.trans_1d = PretrainedHFTransformer(kind="ChemBERTa-77M-MTR", notation="smiles", dtype=float)
+            self.trans_2d = PretrainedDGLTransformer(kind="gin_supervised_infomax", notation="smiles", dtype=float)
+            self.trans_3d = UniMolRepr(data_type='molecule', remove_hs=False, model_name='unimolv1', model_size='84m')
 
-###########################################################
-# 1. RDKit-based tokenizer
-###########################################################
-def rdkit_tokenizer(smiles_str: str):
+            for i in range(len(self.data)):
+                smi = self.data.iloc[i]["SMILES"]
+                y   = self.data.iloc[i]["Y"]
+                rep_1d = self.trans_1d(smi)
+                if not isinstance(rep_1d, torch.Tensor):
+                    rep_1d = torch.tensor(rep_1d, dtype=torch.float32)
+                rep_2d = self.trans_2d(smi)
+                if not isinstance(rep_2d, torch.Tensor):
+                    rep_2d = torch.tensor(rep_2d, dtype=torch.float32)
 
-    mol = Chem.MolFromSmiles(smiles_str)
-    if mol is None:
-        return []
-    return [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+                # 3D = CLS + Atomic
+                rep_3d_all = self.trans_3d.get_repr([smi], return_atomic_reprs=True)
+                cls_repr_3d = rep_3d_all['cls_repr'][0]
+                atomic_reprs= rep_3d_all['atomic_reprs'][0]
+                if not isinstance(cls_repr_3d, torch.Tensor):
+                    cls_repr_3d = torch.tensor(cls_repr_3d, dtype=torch.float32)
+                atomic_tensor = torch.tensor(atomic_reprs, dtype=torch.float32)
 
+                self.samples.append({
+                    "feat_1d": rep_1d,
+                    "feat_2d": rep_2d,
+                    "feat_3d_cls": cls_repr_3d,
+                    "feat_3d_atom": atomic_tensor,
+                    "y": y
+                })
 
-###########################################################
-# 2. SMILES standardization
-###########################################################
-def standardize_smiles(smiles: str, apply_standardization: bool = True, remove_stereo: bool = True) -> str:
-
-    if not apply_standardization:
-        return smiles
-
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
-
-        lfc = rdMolStandardize.LargestFragmentChooser()
-        mol = lfc.choose(mol)
-        if mol is None:
-            return None
-
-        if remove_stereo:
-            Chem.rdmolops.RemoveStereochemistry(mol)
-
-        uncharger = rdMolStandardize.Uncharger()
-        mol = uncharger.uncharge(mol)
-
-        Chem.SanitizeMol(mol)
-        cano = MolToSmiles(mol, isomericSmiles=False)
-        return cano
-
-    except Exception:
-        return None
-
-
-###########################################################
-# 3. Dataset class
-###########################################################
-class CYP2C19Dataset(Dataset):
-
-    def __init__(self, csv_path, transform=None, is_classification=True):
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found: {csv_path}")
-        
-        self.df = pd.read_csv(csv_path)
-        self.transform = transform
-        self.is_classification = is_classification
-
-        if "SMILES" not in self.df.columns or "Label" not in self.df.columns:
-            raise ValueError("CSV must contain 'SMILES' and 'Label' columns.")
+            if cache_path:
+                torch.save(self.samples, cache_path)
 
     def __len__(self):
-        return len(self.df)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        smiles_str = self.df.iloc[idx]["SMILES"]
-        label_val = self.df.iloc[idx]["Label"]
+        return self.samples[idx]
 
-        # Transform label into a tensor
-        if self.is_classification:
-            label_tensor = torch.tensor(label_val, dtype=torch.long)
+def full_feature_collate_fn(batch):
+    feat_1d_list = []
+    feat_2d_list = []
+    cls_3d_list  = []
+    atom_3d_list = []
+    y_list       = []
+
+    for b in batch:
+        feat_1d_list.append(b["feat_1d"].unsqueeze(0))
+        feat_2d_list.append(b["feat_2d"].unsqueeze(0))
+        cls_3d_list.append(b["feat_3d_cls"].unsqueeze(0))
+        atom_3d_list.append(b["feat_3d_atom"])  # (N,512)
+        y_list.append(b["y"])
+
+    feat_1d_tensor = torch.cat(feat_1d_list, dim=0)
+    feat_2d_tensor = torch.cat(feat_2d_list, dim=0)
+    cls_3d_tensor  = torch.cat(cls_3d_list, dim=0)
+
+    max_len = max(t.size(0) for t in atom_3d_list)
+    padded_atoms = []
+    for t in atom_3d_list:
+        pad_size = max_len - t.size(0)
+        if pad_size>0:
+            pad = torch.zeros(pad_size, t.size(1), dtype=t.dtype)
+            t_padded = torch.cat([t,pad], dim=0)
         else:
-            label_tensor = torch.tensor(label_val, dtype=torch.float)
+            t_padded = t
+        padded_atoms.append(t_padded)
+    atom_3d_tensor = torch.stack(padded_atoms, dim=0)
 
-        # Transform SMILES to tokenized data
-        if self.transform is not None:
-            smiles_data = self.transform(smiles_str)
-        else:
-            smiles_data = []
+    y_tensor = torch.tensor(y_list, dtype=torch.float)
 
-        return smiles_data, label_tensor
-
-
-###########################################################
-# 4. Collate function for batching
-###########################################################
-def collate_fn(batch):
-
-    x_list, y_list = [], []
-    for (smiles_data, label) in batch:
-        x_tensor = torch.tensor(smiles_data, dtype=torch.long)
-        x_list.append(x_tensor)
-        y_list.append(label)
-
-    # pad_sequence -> shape = [batch_size, max_seq_len]
-    x_padded = rnn_utils.pad_sequence(x_list, batch_first=True, padding_value=0)
-    labels_tensor = torch.stack(y_list, dim=0)
-
-    return x_padded, labels_tensor
-
-
-###########################################################
-# 5. Preprocessing and saving
-###########################################################
-def preprocess_and_save_data(
-    save_dir: str = "./data",
-    apply_standardization: bool = True,
-    remove_stereo: bool = True
-):
-
-    from tdc.single_pred import ADME
-
-    data = ADME(name='CYP2C19_Veith')
-    split = data.get_split()
-
-    def process_data(df):
-        processed_smiles, processed_labels = [], []
-        for _, row in df.iterrows():
-            std_smi = standardize_smiles(row["Drug"], apply_standardization, remove_stereo)
-            if std_smi:
-                processed_smiles.append(std_smi)
-                processed_labels.append(row["Y"])
-        return pd.DataFrame({"SMILES": processed_smiles, "Label": processed_labels})
-
-    train_data = process_data(split['train'])
-    valid_data = process_data(split['valid'])
-    test_data = process_data(split['test'])
-
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    train_data.to_csv(os.path.join(save_dir, "cyp2c19_train.csv"), index=False)
-    valid_data.to_csv(os.path.join(save_dir, "cyp2c19_valid.csv"), index=False)
-    test_data.to_csv(os.path.join(save_dir, "cyp2c19_test.csv"), index=False)
-
-    print(f"Processed data saved to {save_dir}")
-
-
-###########################################################
-# 6. DataLoader generation function
-###########################################################
-def get_cyp2c19_dataloaders(
-    data_dir="./data",
-    batch_size=32,
-    num_workers=0,
-    shuffle_train=True,
-    is_classification=True
-):
-
-    train_csv = os.path.join(data_dir, "cyp2c19_train.csv")
-    valid_csv = os.path.join(data_dir, "cyp2c19_valid.csv")
-    test_csv = os.path.join(data_dir, "cyp2c19_test.csv")
-
-    train_dataset = CYP2C19Dataset(
-        train_csv,
-        transform=rdkit_tokenizer,
-        is_classification=is_classification
-    )
-    valid_dataset = CYP2C19Dataset(
-        valid_csv,
-        transform=rdkit_tokenizer,
-        is_classification=is_classification
-    )
-    test_dataset = CYP2C19Dataset(
-        test_csv,
-        transform=rdkit_tokenizer,
-        is_classification=is_classification
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle_train,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
-
-    return train_loader, valid_loader, test_loader
+    return {
+        "feat_1d": feat_1d_tensor,
+        "feat_2d": feat_2d_tensor,
+        "feat_3d_cls": cls_3d_tensor,
+        "feat_3d_atom": atom_3d_tensor,
+        "y": y_tensor
+    }
