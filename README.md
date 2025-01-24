@@ -10,8 +10,8 @@ It supports classification and regression tasks, uses PyTorch-based training flo
 ```
 I2M2_admet_property/
 ├── main.py
-├── sweep.py            # you will make this file
-├── sweep_config.yaml   # you will make this file
+├── sweep.py            # you should make this file
+├── sweep_config.yaml   # you should make this file
 ├── unimodal/
 │   ├── chemberta_1d.py
 │   ├── gin_2d.py
