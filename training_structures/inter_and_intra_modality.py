@@ -11,6 +11,17 @@ class InterAndIntraModel(nn.Module):
         self.m3 = model_3d
         self.fusion_module = fusion_module
         self.task_type = task_type
+
+        self.mlp_head = nn.Sequential(
+            nn.Linear(out_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(out_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU()
+        )
+        
         if self.task_type=="classification":
             self.final_fc = nn.Linear(out_dim, 2)
         else:
@@ -25,14 +36,16 @@ class InterAndIntraModel(nn.Module):
         out_1d = self.m1(x1)
         out_2d = self.m2(x2)
         out_3d = self.m3(c3,a3)
-        sum_intra = out_1d + out_2d + out_3d
+        sum_intra = out_1d + out_2d + out_3d  
 
         f1 = self.m1.forward_middle(x1)
         f2 = self.m2.forward_middle(x2)
         f3 = self.m3.forward_middle(c3,a3)
-        fused = self.fusion_module(f1,f2,f3)
-        inter_logit = self.final_fc(fused)
+        fused = self.fusion_module(f1,f2,f3)  
 
+        post = self.mlp_head(fused)         
+        
+        inter_logit = self.final_fc(post)   
         return sum_intra + inter_logit
 
 def get_inter_intra_logits(model, batch, device="cuda"):

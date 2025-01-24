@@ -37,7 +37,6 @@ class FullFeatureDataset(Dataset):
                 if not isinstance(rep_2d, torch.Tensor):
                     rep_2d = torch.tensor(rep_2d, dtype=torch.float32)
 
-                # 3D = CLS + Atomic
                 rep_3d_all = self.trans_3d.get_repr([smi], return_atomic_reprs=True)
                 cls_repr_3d = rep_3d_all['cls_repr'][0]
                 atomic_reprs= rep_3d_all['atomic_reprs'][0]

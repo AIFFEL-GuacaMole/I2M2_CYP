@@ -13,7 +13,6 @@ class UniMol_3D(nn.Module):
         self.max_atomic_len = max_atomic_len
         self.attn = nn.MultiheadAttention(self.atomic_embedding_dim, num_heads=4, batch_first=True)
 
-        # CLS(512) + AtomicSummary(512) -> concat -> 1024
         self.mlp = nn.Sequential(
             nn.Linear(self.cls_embedding_dim + self.atomic_embedding_dim, 512),
             nn.BatchNorm1d(512),
