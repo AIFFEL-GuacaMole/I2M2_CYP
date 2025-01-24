@@ -138,7 +138,7 @@ def main():
             test_model(inter_model, test_loader, 'inter', args, device)
 
     elif args.mode=='inter_intra':
-        fusion_mod = ConcatFusion([256,256,256], out_dim=256)
+        fusion_mod = CrossAttentionFusion(embed_dim=256, num_heads=4, out_dim=256)
         m1 = ChemBERTaModel(task_type=args.task_type)
         m2 = GIN(task_type=args.task_type)
         m3 = UniMol_3D(task_type=args.task_type)

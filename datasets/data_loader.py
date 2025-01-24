@@ -72,7 +72,7 @@ def full_feature_collate_fn(batch):
         feat_1d_list.append(b["feat_1d"].unsqueeze(0))
         feat_2d_list.append(b["feat_2d"].unsqueeze(0))
         cls_3d_list.append(b["feat_3d_cls"].unsqueeze(0))
-        atom_3d_list.append(b["feat_3d_atom"])  # (N,512)
+        atom_3d_list.append(b["feat_3d_atom"]) 
         y_list.append(b["y"])
 
     feat_1d_tensor = torch.cat(feat_1d_list, dim=0)

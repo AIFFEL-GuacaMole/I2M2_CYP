@@ -33,14 +33,14 @@ def train_model(model_or_tuple, train_loader, val_loader, mode, args, device="cu
         opt1 = optim.Adam(m1.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         opt2 = optim.Adam(m2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         opt3 = optim.Adam(m3.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        sched1 = ReduceLROnPlateau(opt1, mode="min", factor=0.5, patience=3, verbose=False)
-        sched2 = ReduceLROnPlateau(opt2, mode="min", factor=0.5, patience=3, verbose=False)
-        sched3 = ReduceLROnPlateau(opt3, mode="min", factor=0.5, patience=3, verbose=False)
+        sched1 = ReduceLROnPlateau(opt1, mode="min", factor=0.5, patience=3, verbose=True)
+        sched2 = ReduceLROnPlateau(opt2, mode="min", factor=0.5, patience=3, verbose=True)
+        sched3 = ReduceLROnPlateau(opt3, mode="min", factor=0.5, patience=3, verbose=True)
 
     else: 
         model = model_or_tuple.to(device)
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=False)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
 
     for epoch in range(args.epochs):
         if mode=="unimodal":
